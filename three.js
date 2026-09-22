@@ -1,457 +1,304 @@
 /**
- * btc-polymarket-paper-bot.js
- * Paper-trading bot: Binance candles -> local Ollama LLM -> Polymarket BTC 15m Up/Down market
- * PAPER MODE ONLY. No real orders are ever placed.
+ * btc-polymarket-paper-bot-final.js
+ * Event-driven flow: new 15m window detected -> fetch data -> LLM decision -> check price -> paper bet.
+ * PAPER MODE ONLY.
  *
- * Run: node btc-polymarket-paper-bot.js
+ * npm i ws
+ * Run: node btc-polymarket-paper-bot-final.js
  */
 
 import fs from "fs";
+import WebSocket from "ws";
 
-// ---------------------------------------------------------------------------
-// CONFIG
-// ---------------------------------------------------------------------------
 const CONFIG = {
-  binance: {
-    symbol: "BTCUSDT",
-    klineIntervals: ["1m", "5m", "15m"],
-    klineLimit: 60,
-  },
+  binance: { symbol: "btcusdt", intervals: ["1m", "5m", "15m"], bufferSize: 60 },
   ollama: {
     host: "http://localhost:11434",
-    model: "llama3.1", // change to whatever model you've pulled
-    confidenceThreshold: 0.62, // minimum model confidence to even consider a bet
+    model: "llama3.2:1b",
+    keepAliveMinutes: 30,
+    numPredict: 60,
+    confidenceThreshold: 0.62,
   },
   polymarket: {
     gammaBase: "https://gamma-api.polymarket.com",
-    clobBase: "https://clob.polymarket.com",
-    searchTerms: ["Bitcoin Up or Down", "BTC Up or Down"],
-    expectedDurationSec: 15 * 60,
-    durationToleranceSec: 120, // allow some slack when matching "15 min" markets
+    wsMarketUrl: "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+    slugPrefix: "btc-updown-15m", // confirm against live market before trusting
+    windowSec: 900,
   },
   risk: {
-    startingBalance: 1000, // paper USD
-    betFractionOfBalance: 0.05, // 5% of current balance per bet
-    minProfitIfWin: 0.05, // 5%
-    maxProfitIfWin: 0.20, // 20%
-  },
-  loop: {
-    pollIntervalMs: 20_000, // check every 20s for new markets / resolutions
+    startingBalance: 1000,
+    betFractionOfBalance: 0.05,
+    minProfitIfWin: 0.05,
+    maxProfitIfWin: 0.20,
   },
   ledgerFile: "./paper_ledger.json",
 };
 
-// ---------------------------------------------------------------------------
-// LEDGER (persisted paper trading state)
-// ---------------------------------------------------------------------------
+// ---------------- LEDGER ----------------
 function loadLedger() {
-  if (fs.existsSync(CONFIG.ledgerFile)) {
-    return JSON.parse(fs.readFileSync(CONFIG.ledgerFile, "utf-8"));
+  if (fs.existsSync(CONFIG.ledgerFile)) return JSON.parse(fs.readFileSync(CONFIG.ledgerFile, "utf-8"));
+  return { balance: CONFIG.risk.startingBalance, trades: [], tradedMarketIds: [] };
+}
+function saveLedger(l) { fs.writeFileSync(CONFIG.ledgerFile, JSON.stringify(l, null, 2)); }
+
+// ---------------- BINANCE WS FEED ----------------
+class BinanceFeed {
+  constructor() {
+    this.buffers = { "1m": [], "5m": [], "15m": [] };
+    this.readyPromise = this.init();
   }
-  return {
-    balance: CONFIG.risk.startingBalance,
-    trades: [], // { marketId, slug, side, entryPrice, shares, betAmount, status, pnl, placedAt, resolvedAt }
-    tradedMarketIds: [], // enforce 1 bet per event
-  };
-}
 
-function saveLedger(ledger) {
-  fs.writeFileSync(CONFIG.ledgerFile, JSON.stringify(ledger, null, 2));
-}
-
-// ---------------------------------------------------------------------------
-// BINANCE: candles + volume
-// ---------------------------------------------------------------------------
-async function fetchKlines(interval) {
-  const url = `https://api.binance.com/api/v3/klines?symbol=${CONFIG.binance.symbol}&interval=${interval}&limit=${CONFIG.binance.klineLimit}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Binance klines fetch failed: ${res.status}`);
-  const raw = await res.json();
-  // Binance kline fields: [openTime, open, high, low, close, volume, closeTime, quoteVolume, trades, ...]
-  return raw.map((k) => ({
-    openTime: k[0],
-    open: parseFloat(k[1]),
-    high: parseFloat(k[2]),
-    low: parseFloat(k[3]),
-    close: parseFloat(k[4]),
-    volume: parseFloat(k[5]),
-    closeTime: k[6],
-    quoteVolume: parseFloat(k[7]),
-    trades: k[8],
-  }));
-}
-
-async function fetch24hStats() {
-  const url = `https://api.binance.com/api/v3/ticker/24hr?symbol=${CONFIG.binance.symbol}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Binance 24hr stats fetch failed: ${res.status}`);
-  const d = await res.json();
-  return {
-    priceChangePercent: parseFloat(d.priceChangePercent),
-    volume: parseFloat(d.volume),
-    quoteVolume: parseFloat(d.quoteVolume),
-    lastPrice: parseFloat(d.lastPrice),
-  };
-}
-
-async function getMarketSnapshot() {
-  const [m1, m5, m15, stats24h] = await Promise.all([
-    fetchKlines("1m"),
-    fetchKlines("5m"),
-    fetchKlines("15m"),
-    fetch24hStats(),
-  ]);
-  return {
-    candles1m: m1,
-    candles5m: m5,
-    candles15m: m15,
-    stats24h,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// SIMPLE TECHNICAL INDICATORS (computed locally, fed into the LLM prompt)
-// ---------------------------------------------------------------------------
-function sma(values, period) {
-  if (values.length < period) return null;
-  const slice = values.slice(-period);
-  return slice.reduce((a, b) => a + b, 0) / period;
-}
-
-function ema(values, period) {
-  if (values.length < period) return null;
-  const k = 2 / (period + 1);
-  let emaVal = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  for (let i = period; i < values.length; i++) {
-    emaVal = values[i] * k + emaVal * (1 - k);
+  async init() {
+    // Backfill instantly via REST so we don't wait on the WS to accumulate history
+    await Promise.all(
+      CONFIG.binance.intervals.map(async (interval) => {
+        const url = `https://api.binance.com/api/v3/klines?symbol=${CONFIG.binance.symbol.toUpperCase()}&interval=${interval}&limit=${CONFIG.binance.bufferSize}`;
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`Binance backfill failed for ${interval}: ${res.status}`);
+        const raw = await res.json();
+        this.buffers[interval] = raw.map((k) => ({
+          openTime: k[0],
+          close: parseFloat(k[4]),
+          volume: parseFloat(k[5]),
+        }));
+      })
+    );
+    console.log("[binance] backfilled history:", Object.fromEntries(
+      Object.entries(this.buffers).map(([k, v]) => [k, v.length])
+    ));
+    this.connect(); // now switch to live WS updates on top of the backfilled data
   }
-  return emaVal;
-}
 
-function rsi(values, period = 14) {
-  if (values.length < period + 1) return null;
-  let gains = 0,
-    losses = 0;
-  for (let i = values.length - period; i < values.length; i++) {
-    const diff = values[i] - values[i - 1];
-    if (diff >= 0) gains += diff;
-    else losses -= diff;
+  connect() {
+    const streams = CONFIG.binance.intervals.map((i) => `${CONFIG.binance.symbol}@kline_${i}`).join("/");
+    this.ws = new WebSocket(`wss://stream.binance.com:9443/stream?streams=${streams}`);
+    this.ws.on("message", (raw) => {
+      const k = JSON.parse(raw).data?.k;
+      if (!k) return;
+      const buf = this.buffers[k.i];
+      if (!buf) return;
+      const candle = { openTime: k.t, close: parseFloat(k.c), volume: parseFloat(k.v) };
+      if (buf.length && buf[buf.length - 1].openTime === candle.openTime) buf[buf.length - 1] = candle;
+      else { buf.push(candle); if (buf.length > CONFIG.binance.bufferSize) buf.shift(); }
+    });
+    this.ws.on("close", () => setTimeout(() => this.connect(), 2000));
+    this.ws.on("error", (e) => console.error("[binance-ws]", e.message));
   }
-  const avgGain = gains / period;
-  const avgLoss = losses / period;
-  if (avgLoss === 0) return 100;
-  const rs = avgGain / avgLoss;
-  return 100 - 100 / (1 + rs);
+
+  ready() { return this.buffers["1m"].length > 25 && this.buffers["5m"].length > 20; }
 }
 
-function buildIndicatorSummary(snapshot) {
-  const closes1m = snapshot.candles1m.map((c) => c.close);
-  const closes5m = snapshot.candles5m.map((c) => c.close);
-  const vols1m = snapshot.candles1m.map((c) => c.volume);
-
-  const last10Vol = vols1m.slice(-10);
-  const prev10Vol = vols1m.slice(-20, -10);
-  const avgLast10 = last10Vol.reduce((a, b) => a + b, 0) / (last10Vol.length || 1);
-  const avgPrev10 = prev10Vol.reduce((a, b) => a + b, 0) / (prev10Vol.length || 1);
-  const volumeTrendPct = avgPrev10 ? ((avgLast10 - avgPrev10) / avgPrev10) * 100 : 0;
-
+// ---------------- INDICATORS ----------------
+function ema(v, p) {
+  if (v.length < p) return null;
+  const k = 2 / (p + 1);
+  let e = v.slice(0, p).reduce((a, b) => a + b, 0) / p;
+  for (let i = p; i < v.length; i++) e = v[i] * k + e * (1 - k);
+  return e;
+}
+function rsi(v, p = 14) {
+  if (v.length < p + 1) return null;
+  let g = 0, l = 0;
+  for (let i = v.length - p; i < v.length; i++) { const d = v[i] - v[i - 1]; if (d >= 0) g += d; else l -= d; }
+  return l === 0 ? 100 : 100 - 100 / (1 + g / l);
+}
+function buildIndicators(feed) {
+  const c1 = feed.buffers["1m"].map((c) => c.close);
+  const v1 = feed.buffers["1m"].map((c) => c.volume);
+  const last10 = v1.slice(-10), prev10 = v1.slice(-20, -10);
+  const avgLast = last10.reduce((a, b) => a + b, 0) / (last10.length || 1);
+  const avgPrev = prev10.reduce((a, b) => a + b, 0) / (prev10.length || 1);
   return {
-    lastPrice: closes1m[closes1m.length - 1],
-    ema9_1m: ema(closes1m, 9),
-    ema21_1m: ema(closes1m, 21),
-    sma20_5m: sma(closes5m, 20),
-    rsi14_1m: rsi(closes1m, 14),
-    priceChange15m: (
-      ((closes1m[closes1m.length - 1] - closes1m[Math.max(0, closes1m.length - 15)]) /
-        closes1m[Math.max(0, closes1m.length - 15)]) *
-      100
-    ).toFixed(3),
-    volumeTrendPct: volumeTrendPct.toFixed(2),
-    change24hPct: snapshot.stats24h.priceChangePercent,
+    lastPrice: c1.at(-1),
+    ema9: ema(c1, 9),
+    ema21: ema(c1, 21),
+    rsi14: rsi(c1, 14),
+    chg15m: (((c1.at(-1) - c1[Math.max(0, c1.length - 15)]) / c1[Math.max(0, c1.length - 15)]) * 100).toFixed(3),
+    volTrendPct: (avgPrev ? ((avgLast - avgPrev) / avgPrev) * 100 : 0).toFixed(2),
   };
 }
 
-// ---------------------------------------------------------------------------
-// OLLAMA: ask the local LLM for a directional call
-// ---------------------------------------------------------------------------
-async function askOllamaForDirection(indicators) {
-  const prompt = `
-You are a short-term BTC/USDT price direction classifier. You will predict whether BTC's price
-will be HIGHER ("UP") or LOWER ("DOWN") than its current price approximately 15 minutes from now.
-
-Current market data:
-- Last price: ${indicators.lastPrice}
-- EMA(9, 1m): ${indicators.ema9_1m}
-- EMA(21, 1m): ${indicators.ema21_1m}
-- SMA(20, 5m): ${indicators.sma20_5m}
-- RSI(14, 1m): ${indicators.rsi14_1m}
-- Price change over last 15 one-minute candles: ${indicators.priceChange15m}%
-- Recent volume trend (last 10 vs prior 10 one-minute candles): ${indicators.volumeTrendPct}%
-- 24h price change: ${indicators.change24hPct}%
-
-Respond ONLY with a JSON object, no other text, in exactly this shape:
-{"direction": "UP" or "DOWN", "confidence": number between 0 and 1, "reasoning": "one short sentence"}
-`.trim();
-
+// ---------------- OLLAMA DECISION ----------------
+async function askOllama(ind) {
+  const prompt = `BTC 15m direction. last=${ind.lastPrice} ema9=${ind.ema9?.toFixed(2)} ema21=${ind.ema21?.toFixed(2)} rsi=${ind.rsi14?.toFixed(1)} chg15m=${ind.chg15m}% volTrend=${ind.volTrendPct}%.
+JSON only, this field order: {"direction":"UP"|"DOWN","confidence":0-1,"reasoning":"<8 words"}`;
   const res = await fetch(`${CONFIG.ollama.host}/api/generate`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: CONFIG.ollama.model,
-      prompt,
-      stream: false,
-      format: "json",
-      options: { temperature: 0.2 },
+      model: CONFIG.ollama.model, prompt, stream: false, format: "json",
+      keep_alive: `${CONFIG.ollama.keepAliveMinutes}m`,
+      options: { temperature: 0.2, num_predict: CONFIG.ollama.numPredict },
     }),
   });
-
-  if (!res.ok) throw new Error(`Ollama request failed: ${res.status}`);
-  const data = await res.json();
-
-  let parsed;
-  try {
-    parsed = JSON.parse(data.response);
-  } catch (e) {
-    throw new Error(`Could not parse Ollama JSON response: ${data.response}`);
-  }
-
-  if (!parsed.direction || typeof parsed.confidence !== "number") {
-    throw new Error(`Malformed Ollama response: ${JSON.stringify(parsed)}`);
-  }
-  return parsed; // { direction, confidence, reasoning }
+  if (!res.ok) throw new Error(`Ollama failed: ${res.status}`);
+  const parsed = JSON.parse((await res.json()).response);
+  if (!parsed.direction || typeof parsed.confidence !== "number") throw new Error("Malformed Ollama output");
+  return parsed;
 }
 
-// ---------------------------------------------------------------------------
-// POLYMARKET: discover the active BTC 15-min Up/Down market
-// ---------------------------------------------------------------------------
-async function findActiveBtc15mMarket() {
-  for (const term of CONFIG.polymarket.searchTerms) {
-    const url = `${CONFIG.polymarket.gammaBase}/public-search?q=${encodeURIComponent(term)}`;
-    const res = await fetch(url);
-    if (!res.ok) continue;
-    const data = await res.json();
-    const events = data.events || [];
+// ---------------- POLYMARKET: direct slug lookup + WS prices ----------------
+async function fetchMarketBySlug(slug) {
+  const res = await fetch(`${CONFIG.polymarket.gammaBase}/events/slug/${slug}`);
+  if (!res.ok) return null;
+  const ev = await res.json();
+  const m = ev?.markets?.[0];
+  if (!m || m.closed || m.active === false) return null;
+  const endMs = new Date(m.endDate).getTime();
+  if (endMs <= Date.now()) return null;
+  try {
+    return {
+      id: m.id, slug: m.slug, question: m.question, endMs,
+      outcomes: JSON.parse(m.outcomes),
+      outcomePrices: JSON.parse(m.outcomePrices).map(Number),
+      clobTokenIds: JSON.parse(m.clobTokenIds),
+      conditionId: m.conditionId,
+    };
+  } catch { return null; }
+}
 
-    const now = Date.now();
+function currentWindowStart() {
+  return Math.floor(Math.floor(Date.now() / 1000) / CONFIG.polymarket.windowSec) * CONFIG.polymarket.windowSec;
+}
 
-    for (const ev of events) {
-      if (!ev.markets || !ev.markets.length) continue;
-      for (const m of ev.markets) {
-        if (m.closed || m.active === false) continue;
-        if (!m.endDate) continue;
-
-        const endMs = new Date(m.endDate).getTime();
-        const startMs = m.createdAt ? new Date(m.createdAt).getTime() : null;
-        const durationSec = startMs ? (endMs - startMs) / 1000 : null;
-
-        const withinDuration =
-          durationSec === null ||
-          Math.abs(durationSec - CONFIG.polymarket.expectedDurationSec) <=
-            CONFIG.polymarket.durationToleranceSec;
-
-        const isFuture = endMs > now;
-        const titleMatches = /up or down/i.test(m.question || ev.title || "");
-
-        if (isFuture && titleMatches && withinDuration) {
-          let outcomes, outcomePrices, clobTokenIds;
-          try {
-            outcomes = JSON.parse(m.outcomes);
-            outcomePrices = JSON.parse(m.outcomePrices).map(Number);
-            clobTokenIds = JSON.parse(m.clobTokenIds);
-          } catch (e) {
-            continue;
-          }
-
-          return {
-            id: m.id,
-            slug: m.slug,
-            question: m.question,
-            endDate: m.endDate,
-            endMs,
-            outcomes, // e.g. ["Up","Down"]
-            outcomePrices, // e.g. [0.55, 0.45]
-            clobTokenIds, // token ids matching outcomes order
-            conditionId: m.conditionId,
-          };
-        }
-      }
-    }
+async function findLiveMarket() {
+  const start = currentWindowStart();
+  for (const ts of [start, start + CONFIG.polymarket.windowSec]) {
+    const m = await fetchMarketBySlug(`${CONFIG.polymarket.slugPrefix}-${ts}`);
+    if (m) return m;
   }
   return null;
 }
 
-// Get a fresher live price for a specific outcome token from the CLOB order book.
-async function getClobMidPrice(tokenId) {
-  try {
-    const res = await fetch(`${CONFIG.polymarket.clobBase}/book?token_id=${tokenId}`);
-    if (!res.ok) return null;
-    const book = await res.json();
-    const bestBid = book.bids?.[0]?.price ? parseFloat(book.bids[0].price) : null;
-    const bestAsk = book.asks?.[0]?.price ? parseFloat(book.asks[0].price) : null;
-    if (bestBid && bestAsk) return (bestBid + bestAsk) / 2;
-    return bestAsk || bestBid || null;
-  } catch {
-    return null;
+class PolymarketFeed {
+  constructor() { this.bestPrices = {}; this.resolved = new Map(); this.subscribed = new Set(); this.connect(); }
+  connect() {
+    this.ws = new WebSocket(CONFIG.polymarket.wsMarketUrl);
+    this.ws.on("open", () => this.subscribed.size && this._sub());
+    this.ws.on("message", (raw) => {
+      const events = JSON.parse(raw); const list = Array.isArray(events) ? events : [events];
+      for (const e of list) {
+        if (e.event_type === "best_bid_ask" && e.asset_id) this.bestPrices[e.asset_id] = { bid: +e.best_bid, ask: +e.best_ask };
+        else if (e.event_type === "book" && e.asset_id) {
+          const bid = e.bids?.[0]?.price ? +e.bids[0].price : null, ask = e.asks?.[0]?.price ? +e.asks[0].price : null;
+          if (bid || ask) this.bestPrices[e.asset_id] = { bid, ask };
+        } else if (e.event_type === "market_resolved") {
+          this.resolved.set(e.condition_id, e.winning_outcome);
+        }
+      }
+    });
+    this.ws.on("close", () => setTimeout(() => this.connect(), 2000));
+    this.ws.on("error", (e) => console.error("[pm-ws]", e.message));
   }
+  _sub() { this.ws.send(JSON.stringify({ assets_ids: [...this.subscribed], type: "market", custom_feature_enabled: true })); }
+  subscribe(ids) { let changed = false; for (const t of ids) if (!this.subscribed.has(t)) { this.subscribed.add(t); changed = true; } if (changed && this.ws.readyState === 1) this._sub(); }
+  midPrice(id) { const p = this.bestPrices[id]; if (!p) return null; return p.bid && p.ask ? (p.bid + p.ask) / 2 : (p.ask || p.bid || null); }
+  getResolution(conditionId) { const w = this.resolved.get(conditionId); if (w) this.resolved.delete(conditionId); return w || null; }
 }
 
-// Re-check a market later to see if it has resolved, and which side won.
-async function fetchMarketResolution(marketId) {
+async function fetchResolutionRest(marketId) {
   const res = await fetch(`${CONFIG.polymarket.gammaBase}/markets/${marketId}`);
   if (!res.ok) return null;
   const m = await res.json();
-  if (!m.closed) return null; // not resolved yet
-
-  let outcomes, outcomePrices;
-  try {
-    outcomes = JSON.parse(m.outcomes);
-    outcomePrices = JSON.parse(m.outcomePrices).map(Number);
-  } catch {
-    return null;
-  }
-  // Winning outcome resolves to price 1, losing to 0
-  const winnerIdx = outcomePrices.findIndex((p) => p >= 0.99);
-  if (winnerIdx === -1) return null;
-  return { winningOutcome: outcomes[winnerIdx] };
+  if (!m.closed) return null;
+  const outcomes = JSON.parse(m.outcomes), prices = JSON.parse(m.outcomePrices).map(Number);
+  const idx = prices.findIndex((p) => p >= 0.99);
+  return idx === -1 ? null : outcomes[idx];
 }
 
-// ---------------------------------------------------------------------------
-// DECISION + PAPER TRADE EXECUTION
-// ---------------------------------------------------------------------------
-function impliedProfitIfWin(entryPrice) {
-  return (1 - entryPrice) / entryPrice;
-}
+// ---------------- CORE PIPELINE: event live -> data -> decision -> bet ----------------
+function impliedProfit(price) { return (1 - price) / price; }
 
-async function evaluateAndMaybeTrade(ledger) {
-  const market = await findActiveBtc15mMarket();
-  if (!market) {
-    console.log("[info] No active BTC 15m Up/Down market found right now.");
-    return;
-  }
+async function runPipelineForMarket(market, ledger, binanceFeed, pmFeed) {
+  if (ledger.tradedMarketIds.includes(market.id)) return; // 1 bet per event
+  if (!binanceFeed.ready()) { console.log("[wait] Binance buffers still warming up"); return; }
 
-  if (ledger.tradedMarketIds.includes(market.id)) {
-    return; // already bet on this event — 1 bet per event rule
-  }
+  pmFeed.subscribe(market.clobTokenIds); // start streaming this event's live prices right away
 
-  console.log(`[market] ${market.question} (id=${market.id}, ends ${market.endDate})`);
+  console.log(`[event live] ${market.question}`);
+  const indicators = buildIndicators(binanceFeed);
+  console.log("[data]", indicators);
 
-  const snapshot = await getMarketSnapshot();
-  const indicators = buildIndicatorSummary(snapshot);
-  console.log("[indicators]", indicators);
+  const decision = await askOllama(indicators);
+  console.log("[decision]", decision);
 
-  const llmCall = await askOllamaForDirection(indicators);
-  console.log("[ollama]", llmCall);
+  ledger.tradedMarketIds.push(market.id); // mark evaluated regardless of outcome below
 
-  if (llmCall.confidence < CONFIG.ollama.confidenceThreshold) {
-    console.log(
-      `[skip] Confidence ${llmCall.confidence} below threshold ${CONFIG.ollama.confidenceThreshold}`
-    );
-    return;
-  }
-
-  // Map LLM direction ("UP"/"DOWN") to the matching Polymarket outcome index.
-  const outcomeIdx = market.outcomes.findIndex(
-    (o) => o.toLowerCase() === llmCall.direction.toLowerCase()
-  );
-  if (outcomeIdx === -1) {
-    console.log(`[skip] Could not map direction "${llmCall.direction}" to market outcomes`, market.outcomes);
-    return;
-  }
-
-  const tokenId = market.clobTokenIds[outcomeIdx];
-  const livePrice = (await getClobMidPrice(tokenId)) ?? market.outcomePrices[outcomeIdx];
-
-  const profitIfWin = impliedProfitIfWin(livePrice);
-  console.log(
-    `[pricing] side=${market.outcomes[outcomeIdx]} price=${livePrice.toFixed(
-      3
-    )} impliedProfitIfWin=${(profitIfWin * 100).toFixed(1)}%`
-  );
-
-  if (profitIfWin < CONFIG.risk.minProfitIfWin || profitIfWin > CONFIG.risk.maxProfitIfWin) {
-    console.log(
-      `[skip] Implied profit ${(profitIfWin * 100).toFixed(1)}% outside target band ` +
-        `[${CONFIG.risk.minProfitIfWin * 100}%-${CONFIG.risk.maxProfitIfWin * 100}%]`
-    );
-    ledger.tradedMarketIds.push(market.id); // don't keep re-evaluating this same event
+  if (decision.confidence < CONFIG.ollama.confidenceThreshold) {
+    console.log(`[no bet] confidence ${decision.confidence} below threshold`);
     saveLedger(ledger);
     return;
   }
 
-  // Size the paper bet
-  const betAmount = ledger.balance * CONFIG.risk.betFractionOfBalance * llmCall.confidence;
-  const shares = betAmount / livePrice;
+  const idx = market.outcomes.findIndex((o) => o.toLowerCase() === decision.direction.toLowerCase());
+  if (idx === -1) { console.log("[no bet] direction did not map to an outcome"); saveLedger(ledger); return; }
 
-  const trade = {
-    marketId: market.id,
-    slug: market.slug,
-    question: market.question,
-    side: market.outcomes[outcomeIdx],
-    entryPrice: livePrice,
-    betAmount: Number(betAmount.toFixed(2)),
-    shares: Number(shares.toFixed(4)),
-    reasoning: llmCall.reasoning,
-    confidence: llmCall.confidence,
-    status: "OPEN",
-    pnl: null,
-    placedAt: new Date().toISOString(),
-    resolveAfter: market.endMs,
-    resolvedAt: null,
-  };
+  const tokenId = market.clobTokenIds[idx];
+  // give the WS a brief moment to deliver a live quote; fall back to Gamma snapshot price
+  await new Promise((r) => setTimeout(r, 300));
+  const price = pmFeed.midPrice(tokenId) ?? market.outcomePrices[idx];
+  const profitIfWin = impliedProfit(price);
 
-  ledger.balance -= trade.betAmount; // paper: reserve the stake
-  ledger.trades.push(trade);
-  ledger.tradedMarketIds.push(market.id);
+  console.log(`[pricing] side=${market.outcomes[idx]} price=${price.toFixed(3)} profitIfWin=${(profitIfWin * 100).toFixed(1)}%`);
+
+  if (profitIfWin < CONFIG.risk.minProfitIfWin || profitIfWin > CONFIG.risk.maxProfitIfWin) {
+    console.log("[no bet] implied profit outside 5-20% band");
+    saveLedger(ledger);
+    return;
+  }
+
+  const betAmount = ledger.balance * CONFIG.risk.betFractionOfBalance * decision.confidence;
+  const shares = betAmount / price;
+  ledger.balance -= betAmount;
+  ledger.trades.push({
+    marketId: market.id, conditionId: market.conditionId, slug: market.slug, question: market.question,
+    side: market.outcomes[idx], entryPrice: price, betAmount: +betAmount.toFixed(2), shares: +shares.toFixed(4),
+    reasoning: decision.reasoning, status: "OPEN", pnl: null, placedAt: new Date().toISOString(), resolveAfter: market.endMs,
+  });
   saveLedger(ledger);
-
-  console.log(
-    `[PAPER TRADE PLACED] ${trade.side} on "${trade.question}" — $${trade.betAmount} @ ${trade.entryPrice.toFixed(
-      3
-    )} (${trade.shares} shares)`
-  );
+  console.log(`[PAPER BET PLACED] ${market.outcomes[idx]} @ ${price.toFixed(3)} | $${betAmount.toFixed(2)}`);
 }
 
-async function checkAndResolveOpenTrades(ledger) {
+async function resolveOpenTrades(ledger, pmFeed) {
   const now = Date.now();
-  const openTrades = ledger.trades.filter((t) => t.status === "OPEN" && now > t.resolveAfter + 30_000);
-
-  for (const trade of openTrades) {
-    const result = await fetchMarketResolution(trade.marketId);
-    if (!result) continue; // not resolved yet on Polymarket's side
-
-    const won = result.winningOutcome.toLowerCase() === trade.side.toLowerCase();
-    const payout = won ? trade.shares * 1.0 : 0;
-    const pnl = payout - trade.betAmount;
-
-    trade.status = won ? "WON" : "LOST";
-    trade.pnl = Number(pnl.toFixed(2));
-    trade.resolvedAt = new Date().toISOString();
-    ledger.balance += payout; // return payout (stake was already deducted at entry)
-
-    console.log(
-      `[RESOLVED] ${trade.question} -> winner=${result.winningOutcome} | your side=${trade.side} | ` +
-        `${trade.status} | PnL=$${trade.pnl} | balance=$${ledger.balance.toFixed(2)}`
-    );
+  const open = ledger.trades.filter((t) => t.status === "OPEN" && now > t.resolveAfter);
+  for (const t of open) {
+    const winner = pmFeed.getResolution(t.conditionId) ?? (await fetchResolutionRest(t.marketId));
+    if (!winner) continue;
+    const won = winner.toLowerCase() === t.side.toLowerCase();
+    const payout = won ? t.shares : 0;
+    t.status = won ? "WON" : "LOST";
+    t.pnl = +(payout - t.betAmount).toFixed(2);
+    t.resolvedAt = new Date().toISOString();
+    ledger.balance += payout;
+    console.log(`[RESOLVED] ${t.slug} -> ${t.status} | PnL=$${t.pnl} | balance=$${ledger.balance.toFixed(2)}`);
   }
-
-  if (openTrades.length) saveLedger(ledger);
+  if (open.length) saveLedger(ledger);
 }
 
-// ---------------------------------------------------------------------------
-// MAIN LOOP
-// ---------------------------------------------------------------------------
-async function mainLoop() {
+// ---------------- MAIN: watch for the live event, react immediately ----------------
+async function main() {
   const ledger = loadLedger();
-  console.log(`\n=== Paper balance: $${ledger.balance.toFixed(2)} | Trades so far: ${ledger.trades.length} ===`);
+  const binanceFeed = new BinanceFeed();
+  await binanceFeed.readyPromise; // resolves almost immediately (one REST round-trip)
 
-  try {
-    await checkAndResolveOpenTrades(ledger);
-    await evaluateAndMaybeTrade(ledger);
-  } catch (err) {
-    console.error("[error]", err.message);
-  }
+  const pmFeed = new PolymarketFeed();
+  let lastSeenMarketId = null;
+  console.log(`Starting. Paper balance: $${ledger.balance.toFixed(2)}`);
+
+  setInterval(async () => {
+    try {
+      await resolveOpenTrades(ledger, pmFeed);
+      const market = await findLiveMarket();
+      if (!market) return;
+      if (market.id !== lastSeenMarketId) {
+        lastSeenMarketId = market.id;
+        await runPipelineForMarket(market, ledger, binanceFeed, pmFeed);
+      }
+    } catch (err) {
+      console.error("[error]", err.message);
+    }
+  }, 2000);
 }
 
-console.log("Starting BTC 15m Polymarket paper-trading bot (PAPER MODE — no real orders).");
-mainLoop();
-setInterval(mainLoop, CONFIG.loop.pollIntervalMs);
+main();
